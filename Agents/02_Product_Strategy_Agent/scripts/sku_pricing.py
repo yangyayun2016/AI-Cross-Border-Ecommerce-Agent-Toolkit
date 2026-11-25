@@ -16,8 +16,11 @@ amazon_us / amazon_eu 在 platform_fees.json 里没有费率数字。
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
+
+_CURRENCY_RE = re.compile(r"(?i)(USD|EUR|GBP|US\$|R\$|BRL|€|£|\$|¥)")
 
 PLATFORMS_FILE = Path(__file__).with_name("platform_fees.json")
 
@@ -322,28 +325,37 @@ def cmd_list_platforms(plats) -> int:
 
 
 def _num(v, default=0.0, kind="dec"):
+    """金额解析。空单元格用 default。写了但不是数字则退出，不当成 0。"""
     if v is None:
         return default
-    s = str(v).strip().replace("R$", "").replace("%", "").replace(" ", "")
-    if s in ("", "-", "—", "暂无", "N/A", "nan"):
+    raw = str(v).strip()
+    if raw in ("", "-", "—", "暂无", "N/A", "nan"):
+        return default
+    s = _CURRENCY_RE.sub("", raw).replace("%", "").replace(" ", "")
+    if s in ("", "-", "—"):
         return default
     neg = s.startswith("-")
     s = s.lstrip("-")
     if kind == "int":
         digits = "".join(ch for ch in s if ch.isdigit())
-        return (-1 if neg else 1) * int(digits) if digits else default
+        if not digits:
+            sys.exit(f"[INPUT_MISSING] 无法把计数字段解析成整数：{raw!r}")
+        return (-1 if neg else 1) * int(digits)
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
     elif "," in s:
         head, _, tail = s.rpartition(",")
-        s = f"{head}.{tail}" if len(tail) <= 2 else head + tail
+        if tail.isdigit() and len(tail) in (1, 2):
+            s = head.replace(",", "") + "." + tail
+        else:
+            s = s.replace(",", "")
     elif "." in s:
         head, _, tail = s.rpartition(".")
         s = s if len(tail) <= 2 else head + tail
     try:
         return (-1 if neg else 1) * float(s)
     except ValueError:
-        return default
+        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}")
 
 
 def _add_common(p):

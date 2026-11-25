@@ -16,8 +16,11 @@
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
+
+_CURRENCY_RE = re.compile(r"(?i)(USD|EUR|GBP|US\$|R\$|BRL|€|£|\$|¥)")
 
 # 与 02 模块共用同一份平台费率预设（单一事实来源）
 PLATFORM_FEES = (Path(__file__).resolve().parents[2]
@@ -94,32 +97,42 @@ COLUMN_MAP = {
 
 
 def _num(v, default=0.0, kind="dec"):
-    """把金额和百分比读成数字。货币符号会去掉，不代表某一种官方货币。"""
+    """把金额和百分比读成数字。货币符号会去掉，不代表某一种官方货币。
+
+    空单元格按 default。写了内容但不是数字时退出，避免把「没解析出来」当成花费 0。
+    逗号末组 1–2 位视为小数（30,00），3 位视为千分位（1,234）。
+    """
     if v is None:
         return default
-    s = str(v).strip().replace("R$", "").replace("%", "").replace(" ", "")
-    if s in ("", "-", "—", "暂无", "N/A", "nan"):
+    raw = str(v).strip()
+    if raw in ("", "-", "—", "暂无", "N/A", "nan", "NaN"):
+        return default
+    s = _CURRENCY_RE.sub("", raw).replace("%", "").replace(" ", "")
+    if s in ("", "-", "—"):
         return default
     neg = s.startswith("-")
     s = s.lstrip("-")
     if kind == "int":
         digits = "".join(ch for ch in s if ch.isdigit())
         if not digits:
-            return default
+            sys.exit(f"[INPUT_MISSING] 无法把计数字段解析成整数：{raw!r}")
         return (-1 if neg else 1) * int(digits)
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") \
             else s.replace(",", "")
     elif "," in s:
         head, _, tail = s.rpartition(",")
-        s = f"{head}.{tail}" if len(tail) <= 2 else head + tail
+        if tail.isdigit() and len(tail) in (1, 2):
+            s = head.replace(",", "") + "." + tail
+        else:
+            s = s.replace(",", "")
     elif "." in s:
         head, _, tail = s.rpartition(".")
         s = s if len(tail) <= 2 else head + tail
     try:
         return (-1 if neg else 1) * float(s)
     except ValueError:
-        return default
+        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}。空着可以，写了就必须是金额。")
 
 
 def _pick(header, kind):

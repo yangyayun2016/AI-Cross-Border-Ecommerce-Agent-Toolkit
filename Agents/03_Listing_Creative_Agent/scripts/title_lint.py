@@ -67,7 +67,7 @@ def analyse(title, args):
     if EMOJI_RE.search(t):
         res.append(("WARN", "emoji", "含表情符号。发布前按该类目规则复核"))
 
-    words = re.findall(r"[A-Za-z0-9]+", t.lower())
+    words = re.findall(r"[^\W_]+", t.lower())
     dup = [w for w in set(words) if words.count(w) >= 3 and len(w) > 2]
     if dup:
         res.append(("FAIL", "duplicates", f"同一词重复 ≥3 次：{'、'.join(dup)}"))
