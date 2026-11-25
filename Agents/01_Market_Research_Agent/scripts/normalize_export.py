@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-shaduola_parser.py — 把类目导出数据（CSV / XLSX）标准化为 JSON
+normalize_export.py — 把调用方导出的表格标准化为 JSON
 
 用途：解决「数据怎么进得来」这一步。Agent 只吃标准化后的 JSON，不吃各平台
       五花八门的导出格式。
@@ -9,9 +9,9 @@ shaduola_parser.py — 把类目导出数据（CSV / XLSX）标准化为 JSON
 依赖：仅标准库。XLSX 支持需要 openpyxl（可选，缺失时会给提示）。
 
 用法：
-    python shaduola_parser.py <输入文件> [-o 输出.json] [--mapping 映射.json]
-    python shaduola_parser.py data.csv -o out.json
-    python shaduola_parser.py data.csv --profile     # 只打印识别到的列，不转换
+    python normalize_export.py <输入文件> [-o 输出.json] [--mapping 映射.json]
+    python normalize_export.py data.csv -o out.json
+    python normalize_export.py data.csv --profile     # 只打印识别到的列，不转换
 """
 
 from __future__ import annotations
@@ -28,18 +28,18 @@ from typing import Any
 # 列名映射：键 = 标准字段名，值 = 可能出现的列名（不区分大小写，去空格后匹配）
 # ---------------------------------------------------------------------------
 DEFAULT_MAPPING: dict[str, list[str]] = {
-    "title":        ["商品名称", "商品名", "标题", "产品名称", "product name", "title", "nome do produto"],
-    "price":        ["价格", "售价", "均价", "商品价格", "price", "preço", "preco"],
-    "monthly_sales": ["月销量", "月销", "30天销量", "近30天销量", "monthly sales", "vendas mensais"],
-    "monthly_revenue": ["月销售额", "月销售额(元)", "销售额", "月gmv", "revenue", "faturamento"],
-    "total_sales":  ["总销量", "累计销量", "total sales", "vendas totais"],
-    "seller":       ["卖家", "店铺", "店铺名称", "卖家名称", "seller", "loja", "vendedor"],
-    "brand":        ["品牌", "品牌名", "brand", "marca"],
-    "rating":       ["评分", "商品评分", "rating", "avaliação", "avaliacao"],
-    "review_count": ["评价数", "评论数", "评价数量", "review count", "avaliações"],
+    "title":        ["商品名称", "商品名", "标题", "产品名称", "product name", "title"],
+    "price":        ["价格", "售价", "均价", "商品价格", "price"],
+    "monthly_sales": ["月销量", "月销", "30天销量", "近30天销量", "monthly sales"],
+    "monthly_revenue": ["月销售额", "月销售额(元)", "销售额", "月gmv", "revenue"],
+    "total_sales":  ["总销量", "累计销量", "total sales"],
+    "seller":       ["卖家", "店铺", "店铺名称", "卖家名称", "seller"],
+    "brand":        ["品牌", "品牌名", "brand"],
+    "rating":       ["评分", "商品评分", "rating"],
+    "review_count": ["评价数", "评论数", "评价数量", "review count"],
     "listing_age_days": ["上架天数", "上架时间", "已上架", "listing age"],
     "url":          ["商品链接", "链接", "url", "link"],
-    "category":     ["类目", "分类", "category", "categoria"],
+    "category":     ["类目", "分类", "category"],
 }
 
 # 标准化输出中的数值字段
@@ -66,26 +66,34 @@ def _to_number(raw: Any) -> float | None:
     """
     把脏数据转成数字。
 
-    处理：货币符号（R$ / $ / ¥ / BRL）、千分位（逗号/点/空格）、
-          中文数量单位（万 / 亿）、百分比、空值、'-' / 'N/A'。
+    货币符号会去掉，但不在这里换汇。整数部分为 0 时，逗号后视为小数（0,125）。
+    普通空格、不换行空格和窄不换行空格都当作千分位分隔，例如 1 234,56。
     """
+    value, _code = _amount_and_currency(raw)
+    return value
+
+
+def _amount_and_currency(raw: Any) -> tuple[float | None, str | None]:
     if raw is None:
-        return None
+        return None, None
     if isinstance(raw, (int, float)):
         try:
-            return float(raw)
+            return float(raw), None
         except (TypeError, ValueError):
-            return None
+            return None, None
 
-    s = str(raw).strip()
-    if s == "" or s.lower() in {"-", "--", "n/a", "na", "não", "nao", "null", "none", "无", "暂无"}:
-        return None
+    text = str(raw).strip()
+    if text == "" or text.lower() in {"-", "--", "n/a", "na", "não", "nao", "null", "none", "无", "暂无"}:
+        return None, None
 
-    # 去掉货币符号与文字
-    s = re.sub(r"(?i)(R\$|BRL|USD|\$|¥|€|£|元|雷亚尔)", "", s)
-    s = s.replace("%", "").strip()
+    codes = {_CURRENCY_CODE.get(tok.upper(), _CURRENCY_CODE.get(tok, tok))
+             for tok in _CURRENCY_RE.findall(text)}
+    if len(codes) > 1:
+        print(f"[warn] 同一格里有多种货币，已跳过：{text}", file=sys.stderr)
+        return None, None
+    neg = text.lstrip().startswith(("-", "−"))
+    s = _CURRENCY_RE.sub("", text).replace("%", "").strip()
 
-    # 中文/英文数量单位
     mult = 1.0
     for unit, factor in _CN_UNITS.items():
         if s.endswith(unit):
@@ -93,23 +101,50 @@ def _to_number(raw: Any) -> float | None:
             s = s[: -len(unit)].strip()
             break
 
-    # 去掉千分位分隔（保留最后一个作为小数点的情况交给下面判断）
-    s = s.replace(" ", "")
-    if "," in s and "." in s:
-        # 两者都有：最后出现的那个是小数点  1.234,56 → 1234.56 / 1,234.56 → 1234.56
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "," in s:
-        # 只有逗号：1,234 视为千分位；1,5 视为小数点
-        head, _, tail = s.rpartition(",")
-        s = (head.replace(",", "") + "." + tail) if len(tail) == 1 else s.replace(",", "")
-
+    s = re.sub(r"\s+", "", s).lstrip("+-−")
+    if s == "":
+        return None, (next(iter(codes)) if codes else None)
     try:
-        return float(s) * mult
+        value = _parse_plain_amount(s) * mult
     except ValueError:
-        return None
+        return None, None
+    return ((-value if neg else value), (next(iter(codes)) if codes else None))
+
+
+_CURRENCY_RE = re.compile(r"(?i)(BRL|R\$|USD|US\$|EUR|GBP|CNY|RMB|JPY|€|£|¥|元|\$)")
+_CURRENCY_CODE = {
+    "BRL": "BRL", "R$": "BRL",
+    "USD": "USD", "US$": "USD", "$": "USD",
+    "EUR": "EUR", "€": "EUR",
+    "GBP": "GBP", "£": "GBP",
+    "CNY": "CNY", "RMB": "CNY", "元": "CNY",
+    "JPY": "JPY", "¥": "JPY",
+}
+
+
+def _parse_plain_amount(s: str) -> float:
+    if not re.fullmatch(r"\d+(?:[.,]\d+)*", s):
+        raise ValueError(s)
+    if "," in s and "." in s:
+        body = (s.replace(".", "").replace(",", ".")
+                if s.rfind(",") > s.rfind(".") else s.replace(",", ""))
+        return float(body)
+    if "," not in s and "." not in s:
+        return float(s)
+    sep = "," if "," in s else "."
+    head, *tails = s.split(sep)
+    if not all(part.isdigit() for part in tails):
+        raise ValueError(s)
+    if len(tails) == 1 and int(head) == 0:
+        return float(f"0.{tails[0]}")
+    if len(tails) == 1 and len(tails[0]) in (1, 2):
+        return float(f"{int(head)}.{tails[0]}")
+    if all(len(part) == 3 for part in tails):
+        return float(head + "".join(tails))
+    if (len(tails) > 1 and all(len(part) == 3 for part in tails[:-1])
+            and len(tails[-1]) in (1, 2)):
+        return float(head + "".join(tails[:-1]) + "." + tails[-1])
+    raise ValueError(s)
 
 
 def _to_days(raw: Any) -> int | None:

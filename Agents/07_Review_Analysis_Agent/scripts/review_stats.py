@@ -28,9 +28,9 @@ from pathlib import Path
 
 WEIGHT = {"强": 3, "中": 2, "弱": 1}
 
-RATING_COLS = ["rating", "评分", "星级", "avaliacao", "estrelas", "stars"]
-CATEGORY_COLS = ["category", "归因", "分类", "差评归因", "categoria"]
-IMAGE_COLS = ["has_image", "带图", "有图", "com_imagem", "com_foto", "image"]
+RATING_COLS = ["rating", "评分", "星级", "stars"]
+CATEGORY_COLS = ["category", "归因", "分类", "差评归因"]
+IMAGE_COLS = ["has_image", "带图", "有图", "image"]
 POINT_COLS = ["卖点", "selling_point", "point"]
 FREQ_COLS = ["频次", "次数", "frequency", "count"]
 STRENGTH_COLS = ["强度", "情感强度", "strength", "weight"]
@@ -70,7 +70,7 @@ def _num(v, default=0.0):
 
 
 def _truthy(v) -> bool:
-    return str(v).strip().lower() in ("1", "1.0", "true", "yes", "y", "是", "有", "sim")
+    return str(v).strip().lower() in ("1", "1.0", "true", "yes", "y", "是", "有")
 
 
 # ---------------------------------------------------------------- 主计算
