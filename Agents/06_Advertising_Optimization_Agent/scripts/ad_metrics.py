@@ -20,7 +20,15 @@ import re
 import sys
 from pathlib import Path
 
-_CURRENCY_RE = re.compile(r"(?i)(USD|EUR|GBP|US\$|R\$|BRL|€|£|\$|¥)")
+_CURRENCY_RE = re.compile(r"(?i)(BRL|R\$|USD|US\$|EUR|GBP|CNY|RMB|JPY|€|£|¥|元|\$)")
+_CURRENCY_CODE = {
+    "BRL": "BRL", "R$": "BRL",
+    "USD": "USD", "US$": "USD", "$": "USD",
+    "EUR": "EUR", "€": "EUR",
+    "GBP": "GBP", "£": "GBP",
+    "CNY": "CNY", "RMB": "CNY", "元": "CNY",
+    "JPY": "JPY", "¥": "JPY",
+}
 
 # 与 02 模块共用同一份平台费率预设（单一事实来源）
 PLATFORM_FEES = (Path(__file__).resolve().parents[2]
@@ -96,43 +104,74 @@ COLUMN_MAP = {
 }
 
 
-def _num(v, default=0.0, kind="dec"):
-    """把金额和百分比读成数字。货币符号会去掉，不代表某一种官方货币。
+def _currency_codes(raw: str) -> set[str]:
+    return {_CURRENCY_CODE.get(tok.upper(), _CURRENCY_CODE.get(tok, tok))
+            for tok in _CURRENCY_RE.findall(raw)}
 
-    空单元格按 default。写了内容但不是数字时退出，避免把「没解析出来」当成花费 0。
-    逗号末组 1–2 位视为小数（30,00），3 位视为千分位（1,234）。
-    """
+
+def _parse_plain_amount(s: str) -> float:
+    """整数部分为 0 时，后面全部是小数（0,125 / 0.125），不当成千分位。"""
+    if not re.fullmatch(r"\d+(?:[.,]\d+)*", s):
+        raise ValueError(s)
+    if "," in s and "." in s:
+        body = (s.replace(".", "").replace(",", ".")
+                if s.rfind(",") > s.rfind(".") else s.replace(",", ""))
+        return float(body)
+    if "," not in s and "." not in s:
+        return float(s)
+    sep = "," if "," in s else "."
+    head, *tails = s.split(sep)
+    if not all(part.isdigit() for part in tails):
+        raise ValueError(s)
+    if len(tails) == 1 and int(head) == 0:
+        return float(f"0.{tails[0]}")
+    if len(tails) == 1 and len(tails[0]) in (1, 2):
+        return float(f"{int(head)}.{tails[0]}")
+    if all(len(part) == 3 for part in tails):
+        return float(head + "".join(tails))
+    if (len(tails) > 1 and all(len(part) == 3 for part in tails[:-1])
+            and len(tails[-1]) in (1, 2)):
+        return float(head + "".join(tails[:-1]) + "." + tails[-1])
+    raise ValueError(s)
+
+
+def _money(v, default=0.0):
+    """返回 (金额, 货币代码或 None)。不换汇。空单元格用 default。"""
     if v is None:
-        return default
+        return default, None
     raw = str(v).strip()
     if raw in ("", "-", "—", "暂无", "N/A", "nan", "NaN"):
-        return default
-    s = _CURRENCY_RE.sub("", raw).replace("%", "").replace(" ", "")
+        return default, None
+    codes = _currency_codes(raw)
+    if len(codes) > 1:
+        sys.exit(f"[INPUT_MISSING] 同一格里有多种货币 {sorted(codes)}：{raw!r}。请先换算成一种货币。")
+    neg = raw.lstrip().startswith(("-", "−"))
+    s = _CURRENCY_RE.sub("", raw).replace("%", "")
+    s = re.sub(r"\s+", "", s).lstrip("+-−")
     if s in ("", "-", "—"):
-        return default
-    neg = s.startswith("-")
-    s = s.lstrip("-")
+        return default, (next(iter(codes)) if codes else None)
+    try:
+        value = _parse_plain_amount(s)
+    except ValueError:
+        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}。空着可以，写了就必须是金额。")
+    return ((-value if neg else value), (next(iter(codes)) if codes else None))
+
+
+def _num(v, default=0.0, kind="dec"):
+    """金额或计数。空单元格用 default。写了但不是数字则退出，不当成 0。"""
     if kind == "int":
-        digits = "".join(ch for ch in s if ch.isdigit())
+        if v is None:
+            return default
+        raw = str(v).strip()
+        if raw in ("", "-", "—", "暂无", "N/A", "nan", "NaN"):
+            return default
+        neg = raw.lstrip().startswith(("-", "−"))
+        digits = "".join(ch for ch in re.sub(r"\s+", "", raw) if ch.isdigit())
         if not digits:
             sys.exit(f"[INPUT_MISSING] 无法把计数字段解析成整数：{raw!r}")
         return (-1 if neg else 1) * int(digits)
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") \
-            else s.replace(",", "")
-    elif "," in s:
-        head, _, tail = s.rpartition(",")
-        if tail.isdigit() and len(tail) in (1, 2):
-            s = head.replace(",", "") + "." + tail
-        else:
-            s = s.replace(",", "")
-    elif "." in s:
-        head, _, tail = s.rpartition(".")
-        s = s if len(tail) <= 2 else head + tail
-    try:
-        return (-1 if neg else 1) * float(s)
-    except ValueError:
-        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}。空着可以，写了就必须是金额。")
+    value, _code = _money(v, default)
+    return value
 
 
 def _pick(header, kind):
@@ -246,13 +285,24 @@ def cmd_diagnose(args):
         sys.exit(f"[ERROR] 认不出这些列（可用映射见 references/metrics.md）：{missing}")
 
     results, totals = [], dict(spend=0.0, gmv=0.0, orders=0.0, clicks=0.0, impressions=0.0)
+    file_codes: set[str] = set()
     for r in rows:
-        row = dict(name=(r.get(col["name"]) or "?").strip(),
+        name = (r.get(col["name"]) or "?").strip()
+        spend, spend_ccy = _money(r.get(col["spend"]))
+        gmv, gmv_ccy = _money(r.get(col["gmv"])) if col["gmv"] else (0.0, None)
+        codes = {c for c in (spend_ccy, gmv_ccy) if c}
+        if len(codes) > 1 or (file_codes and codes and codes != file_codes):
+            sys.exit("[INPUT_MISSING] "
+                     f"{name} 的花费和销售额不是同一种货币："
+                     f"{'、'.join(sorted(file_codes | codes))}。"
+                     "请先换算，本脚本不换汇。")
+        file_codes |= codes
+        row = dict(name=name,
                    impressions=_num(r.get(col["impressions"]), kind="int"),
                    clicks=_num(r.get(col["clicks"]), kind="int"),
-                   spend=_num(r.get(col["spend"]), kind="dec"),
+                   spend=spend,
                    orders=_num(r.get(col["orders"]), kind="int"),
-                   gmv=_num(r.get(col["gmv"]), kind="dec") if col["gmv"] else 0.0)
+                   gmv=gmv)
         grade, acts, met = _grade(row, m, args, be_roas, target_roas)
         results.append(dict(campaign=row["name"], grade=grade,
                             impressions=row["impressions"], clicks=row["clicks"],

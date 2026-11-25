@@ -20,7 +20,15 @@ import re
 import sys
 from pathlib import Path
 
-_CURRENCY_RE = re.compile(r"(?i)(USD|EUR|GBP|US\$|R\$|BRL|€|£|\$|¥)")
+_CURRENCY_RE = re.compile(r"(?i)(BRL|R\$|USD|US\$|EUR|GBP|CNY|RMB|JPY|€|£|¥|元|\$)")
+_CURRENCY_CODE = {
+    "BRL": "BRL", "R$": "BRL",
+    "USD": "USD", "US$": "USD", "$": "USD",
+    "EUR": "EUR", "€": "EUR",
+    "GBP": "GBP", "£": "GBP",
+    "CNY": "CNY", "RMB": "CNY", "元": "CNY",
+    "JPY": "JPY", "¥": "JPY",
+}
 
 PLATFORMS_FILE = Path(__file__).with_name("platform_fees.json")
 
@@ -226,11 +234,23 @@ def cmd_matrix(args, plats) -> int:
     fm = _model_from_args(args, plats)
     tm_pct = fm.target_margin()
     tm = (tm_pct / 100) if tm_pct is not None else None
+    declared = _known_currency(getattr(args, "currency", None))
+    if getattr(args, "currency", None) and declared is None:
+        sys.exit("[INPUT_MISSING] --currency 请使用 USD、EUR、GBP、BRL、CNY 或 JPY。"
+                 "本脚本只核对货币是否一致，不换汇。")
     results = []
+    file_codes: set[str] = set()
     for r in rows:
         name = (r.get(c_name) or "?").strip()
-        price = _num(r.get(c_price), kind="dec")
-        cost = _num(r.get(c_cost), kind="dec")
+        price, price_ccy = _money(r.get(c_price))
+        cost, cost_ccy = _money(r.get(c_cost))
+        row_ccy = _same_currency(price_ccy, cost_ccy, declared=declared, where=f"{name} 的")
+        if row_ccy:
+            if file_codes and row_ccy not in file_codes:
+                sys.exit("[INPUT_MISSING] 表里出现了多种货币："
+                         f"{'、'.join(sorted(file_codes | {row_ccy}))}。"
+                         "请先换算成同一种货币，本脚本不换汇。")
+            file_codes.add(row_ccy)
         if price <= 0 or cost <= 0:
             results.append(dict(sku=name, error="价格或成本非正数，跳过"))
             continue
@@ -324,38 +344,96 @@ def cmd_list_platforms(plats) -> int:
     return 0
 
 
-def _num(v, default=0.0, kind="dec"):
-    """金额解析。空单元格用 default。写了但不是数字则退出，不当成 0。"""
+def _currency_codes(raw: str) -> set[str]:
+    return {_CURRENCY_CODE.get(tok.upper(), _CURRENCY_CODE.get(tok, tok))
+            for tok in _CURRENCY_RE.findall(raw)}
+
+
+def _known_currency(label: str | None) -> str | None:
+    if not label:
+        return None
+    token = label.strip()
+    if not token or token in ("未标明", "金额"):
+        return None
+    return _CURRENCY_CODE.get(token.upper(), _CURRENCY_CODE.get(token))
+
+
+def _parse_plain_amount(s: str) -> float:
+    """s 只剩数字和分隔符。整数部分为 0 时，逗号或点后面都是小数（0,125 / 0.125）。"""
+    if not re.fullmatch(r"\d+(?:[.,]\d+)*", s):
+        raise ValueError(s)
+    if "," in s and "." in s:
+        body = (s.replace(".", "").replace(",", ".")
+                if s.rfind(",") > s.rfind(".") else s.replace(",", ""))
+        return float(body)
+    if "," not in s and "." not in s:
+        return float(s)
+    sep = "," if "," in s else "."
+    head, *tails = s.split(sep)
+    if not all(part.isdigit() for part in tails):
+        raise ValueError(s)
+    if len(tails) == 1 and int(head) == 0:
+        return float(f"0.{tails[0]}")
+    if len(tails) == 1 and len(tails[0]) in (1, 2):
+        return float(f"{int(head)}.{tails[0]}")
+    if all(len(part) == 3 for part in tails):
+        return float(head + "".join(tails))
+    if (len(tails) > 1 and all(len(part) == 3 for part in tails[:-1])
+            and len(tails[-1]) in (1, 2)):
+        return float(head + "".join(tails[:-1]) + "." + tails[-1])
+    raise ValueError(s)
+
+
+def _money(v, default=0.0):
+    """返回 (金额, 货币代码或 None)。空单元格金额为 default。不换汇。"""
     if v is None:
-        return default
+        return default, None
     raw = str(v).strip()
     if raw in ("", "-", "—", "暂无", "N/A", "nan"):
-        return default
-    s = _CURRENCY_RE.sub("", raw).replace("%", "").replace(" ", "")
+        return default, None
+    codes = _currency_codes(raw)
+    if len(codes) > 1:
+        sys.exit(f"[INPUT_MISSING] 同一格里有多种货币 {sorted(codes)}：{raw!r}。请先换算成一种货币。")
+    neg = raw.lstrip().startswith(("-", "−"))
+    s = _CURRENCY_RE.sub("", raw).replace("%", "")
+    s = re.sub(r"\s+", "", s).lstrip("+-−")
     if s in ("", "-", "—"):
-        return default
-    neg = s.startswith("-")
-    s = s.lstrip("-")
+        return default, (next(iter(codes)) if codes else None)
+    try:
+        value = _parse_plain_amount(s)
+    except ValueError:
+        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}")
+    return ((-value if neg else value), (next(iter(codes)) if codes else None))
+
+
+def _same_currency(*codes, declared=None, where=""):
+    explicit = {c for c in codes if c}
+    if declared and explicit and explicit != {declared}:
+        sys.exit("[INPUT_MISSING] "
+                 f"{where}单元格货币是 {'、'.join(sorted(explicit))}，"
+                 f"声明的货币是 {declared}。请先换算成同一种货币，本脚本不换汇。")
+    if len(explicit) > 1:
+        sys.exit("[INPUT_MISSING] "
+                 f"{where}出现了多种货币：{'、'.join(sorted(explicit))}。"
+                 "请先换算成同一种货币，本脚本不换汇。")
+    return next(iter(explicit), None) if len(explicit) == 1 else declared
+
+
+def _num(v, default=0.0, kind="dec"):
+    """金额或计数。空单元格用 default。写了但不是数字则退出，不当成 0。"""
     if kind == "int":
-        digits = "".join(ch for ch in s if ch.isdigit())
+        if v is None:
+            return default
+        raw = str(v).strip()
+        if raw in ("", "-", "—", "暂无", "N/A", "nan"):
+            return default
+        neg = raw.lstrip().startswith(("-", "−"))
+        digits = "".join(ch for ch in raw if ch.isdigit())
         if not digits:
             sys.exit(f"[INPUT_MISSING] 无法把计数字段解析成整数：{raw!r}")
         return (-1 if neg else 1) * int(digits)
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
-    elif "," in s:
-        head, _, tail = s.rpartition(",")
-        if tail.isdigit() and len(tail) in (1, 2):
-            s = head.replace(",", "") + "." + tail
-        else:
-            s = s.replace(",", "")
-    elif "." in s:
-        head, _, tail = s.rpartition(".")
-        s = s if len(tail) <= 2 else head + tail
-    try:
-        return (-1 if neg else 1) * float(s)
-    except ValueError:
-        sys.exit(f"[INPUT_MISSING] 无法把金额解析成数字：{raw!r}")
+    value, _code = _money(v, default)
+    return value
 
 
 def _add_common(p):

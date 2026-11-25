@@ -66,26 +66,34 @@ def _to_number(raw: Any) -> float | None:
     """
     把脏数据转成数字。
 
-    处理：常见货币符号、千分位（逗号/点/空格）、
-          中文数量单位（万 / 亿）、百分比、空值、'-' / 'N/A'。
+    货币符号会去掉，但不在这里换汇。整数部分为 0 时，逗号后视为小数（0,125）。
+    普通空格、不换行空格和窄不换行空格都当作千分位分隔，例如 1 234,56。
     """
+    value, _code = _amount_and_currency(raw)
+    return value
+
+
+def _amount_and_currency(raw: Any) -> tuple[float | None, str | None]:
     if raw is None:
-        return None
+        return None, None
     if isinstance(raw, (int, float)):
         try:
-            return float(raw)
+            return float(raw), None
         except (TypeError, ValueError):
-            return None
+            return None, None
 
-    s = str(raw).strip()
-    if s == "" or s.lower() in {"-", "--", "n/a", "na", "não", "nao", "null", "none", "无", "暂无"}:
-        return None
+    text = str(raw).strip()
+    if text == "" or text.lower() in {"-", "--", "n/a", "na", "não", "nao", "null", "none", "无", "暂无"}:
+        return None, None
 
-    # 去掉货币符号与文字
-    s = re.sub(r"(?i)(USD|EUR|GBP|R\$|BRL|\$|¥|€|£|元)", "", s)
-    s = s.replace("%", "").strip()
+    codes = {_CURRENCY_CODE.get(tok.upper(), _CURRENCY_CODE.get(tok, tok))
+             for tok in _CURRENCY_RE.findall(text)}
+    if len(codes) > 1:
+        print(f"[warn] 同一格里有多种货币，已跳过：{text}", file=sys.stderr)
+        return None, None
+    neg = text.lstrip().startswith(("-", "−"))
+    s = _CURRENCY_RE.sub("", text).replace("%", "").strip()
 
-    # 中文/英文数量单位
     mult = 1.0
     for unit, factor in _CN_UNITS.items():
         if s.endswith(unit):
@@ -93,26 +101,50 @@ def _to_number(raw: Any) -> float | None:
             s = s[: -len(unit)].strip()
             break
 
-    # 去掉千分位分隔（保留最后一个作为小数点的情况交给下面判断）
-    s = s.replace(" ", "")
-    if "," in s and "." in s:
-        # 两者都有：最后出现的那个是小数点  1.234,56 → 1234.56 / 1,234.56 → 1234.56
-        if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "," in s:
-        # 只有逗号：末组 1–2 位是小数（19,99 / 1,5）；末组 3 位是千分位（1,234 / 1,234,567）
-        head, _, tail = s.rpartition(",")
-        if tail.isdigit() and len(tail) in (1, 2):
-            s = head.replace(",", "") + "." + tail
-        else:
-            s = s.replace(",", "")
-
+    s = re.sub(r"\s+", "", s).lstrip("+-−")
+    if s == "":
+        return None, (next(iter(codes)) if codes else None)
     try:
-        return float(s) * mult
+        value = _parse_plain_amount(s) * mult
     except ValueError:
-        return None
+        return None, None
+    return ((-value if neg else value), (next(iter(codes)) if codes else None))
+
+
+_CURRENCY_RE = re.compile(r"(?i)(BRL|R\$|USD|US\$|EUR|GBP|CNY|RMB|JPY|€|£|¥|元|\$)")
+_CURRENCY_CODE = {
+    "BRL": "BRL", "R$": "BRL",
+    "USD": "USD", "US$": "USD", "$": "USD",
+    "EUR": "EUR", "€": "EUR",
+    "GBP": "GBP", "£": "GBP",
+    "CNY": "CNY", "RMB": "CNY", "元": "CNY",
+    "JPY": "JPY", "¥": "JPY",
+}
+
+
+def _parse_plain_amount(s: str) -> float:
+    if not re.fullmatch(r"\d+(?:[.,]\d+)*", s):
+        raise ValueError(s)
+    if "," in s and "." in s:
+        body = (s.replace(".", "").replace(",", ".")
+                if s.rfind(",") > s.rfind(".") else s.replace(",", ""))
+        return float(body)
+    if "," not in s and "." not in s:
+        return float(s)
+    sep = "," if "," in s else "."
+    head, *tails = s.split(sep)
+    if not all(part.isdigit() for part in tails):
+        raise ValueError(s)
+    if len(tails) == 1 and int(head) == 0:
+        return float(f"0.{tails[0]}")
+    if len(tails) == 1 and len(tails[0]) in (1, 2):
+        return float(f"{int(head)}.{tails[0]}")
+    if all(len(part) == 3 for part in tails):
+        return float(head + "".join(tails))
+    if (len(tails) > 1 and all(len(part) == 3 for part in tails[:-1])
+            and len(tails[-1]) in (1, 2)):
+        return float(head + "".join(tails[:-1]) + "." + tails[-1])
+    raise ValueError(s)
 
 
 def _to_days(raw: Any) -> int | None:
