@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
-"""像素级商品主图合规校验（Shopee / Mercado Livre / Amazon）。
+"""像素级商品主图检查（Amazon 规则卡）。
 
-  python check_main_image.py 图.png --platform mercadolivre
-  python check_main_image.py 图.png --platform shopee --fix 修复后.png
+  python check_main_image.py 图.png --platform amazon
   python check_main_image.py 图.png --platform amazon --json
 
-只依赖 Pillow。校验阈值来自 references/ 下各平台规则卡，不是拍脑袋。
-
-检查项
-  size_min        : 短边像素（低于平台最小值 = 直接 fail）
-  square          : 宽高比 1:1（±1%，非正方形会被平台自动裁切）
-  coverage        : 主体包围盒最长边 ÷ 图边（三平台要求不同，ML 最严 ~95%）
-  white_bg        : 边缘 2% 带内近白像素占比（Amazon 必须 / Shopee 优先 / ML 不适用）
-  bg_uniformity   : 边缘带主色占比（ML 的"背景干净"，informational）
-  file_size       : 平台单图上限（Shopee 2MB 最严）
-
---fix 自动修复：近白像素拉到纯白、补成正方形、按目标占比重排画布。
-  （ML 实景背景的"清理"需要抠图，脚本不做，会明确提示。）
+阈值来自 references/platform-amazon.md，发布前到 Seller Central 复核。
+检查短边、是否接近正方形、主体占比、边缘是否接近纯白、文件大小。
+主图上的文字和 Logo 需要人工看。
+--fix 会把近白拉成纯白并按规则卡重排画布，不代替人工复核。
 """
 import argparse
 import json
@@ -28,16 +19,8 @@ try:
 except ImportError:
     sys.exit("需要 Pillow：pip install pillow")
 
-# 平台阈值（来源：references/platform-*.md 规则卡）
+# 平台阈值（来源：references/platform-amazon.md；发布前复核）
 PLATFORMS = {
-    "shopee": dict(
-        min_px=500, rec_px=1024, cover_min=0.60, cover_lo=0.70, cover_hi=0.92,
-        white_fail=0.90, white_warn=0.98, uniform_info=0.90, max_mb=2, fix_target=0.80,
-    ),
-    "mercadolivre": dict(
-        min_px=500, rec_px=1200, cover_min=0.80, cover_lo=0.85, cover_hi=0.97,
-        white_fail=None, white_warn=None, uniform_info=0.90, max_mb=10, fix_target=0.88,
-    ),
     "amazon": dict(
         min_px=1000, rec_px=2000, cover_min=0.85, cover_lo=0.85, cover_hi=0.97,
         white_fail=0.98, white_warn=0.99, uniform_info=0.90, max_mb=10, fix_target=0.87,
@@ -114,7 +97,7 @@ def check(img, path, plt_name, args):
     # 尺寸
     mn = min(m["width"], m["height"])
     if mn < p["min_px"]:
-        add("FAIL", "size_min", f"{mn}px < 平台最低 {p['min_px']}px")
+        add("FAIL", "size_min", f"{mn}px < 规则卡 {p['min_px']}px（发布前复核）")
     elif mn < p["rec_px"]:
         add("WARN", "size_min", f"{mn}px 达最低但低于推荐 {p['rec_px']}px（缩放功能受限）")
     else:
@@ -123,20 +106,20 @@ def check(img, path, plt_name, args):
     # 正方形
     ratio = abs(m["width"] - m["height"]) / max(m["width"], m["height"])
     if ratio > 0.01:
-        add("FAIL", "square", f"{m['width']}×{m['height']} 非正方形（会被平台自动裁切）")
+        add("FAIL", "square", f"{m['width']}×{m['height']} 不是 1:1（规则卡要求接近正方形）")
     else:
         add("PASS", "square", "1:1")
 
     # 主体占比
     c = m["coverage"]
     if c < p["cover_min"]:
-        add("FAIL", "coverage", f"{c:.0%} < 平台下限 {p['cover_min']:.0%}")
+        add("FAIL", "coverage", f"{c:.0%} < 规则卡 {p['cover_min']:.0%}（发布前复核）")
     elif c < p["cover_lo"] or c > p["cover_hi"]:
         add("WARN", "coverage", f"{c:.0%} 超出甜区 {p['cover_lo']:.0%}–{p['cover_hi']:.0%}")
     else:
         add("PASS", "coverage", f"{c:.0%}")
 
-    # 背景纯白（Amazon 必须 / Shopee 优先 / ML 不适用）
+    # 背景是否接近纯白（规则卡；发布前复核）
     if p["white_fail"] is not None:
         wb = m["white_background"]
         if wb < p["white_fail"]:
@@ -165,10 +148,7 @@ def check(img, path, plt_name, args):
         add("PASS", "file_size", f"{mb:.2f} MB ≤ {p['max_mb']} MB")
 
     # 无法自动检测的项 → 人工确认
-    if plt_name == "mercadolivre":
-        add("MANUAL", "ml_cover_text", "首图禁促销文字/平台属性词/水印/边框 —— 人工确认")
-    if plt_name == "shopee":
-        add("MANUAL", "shopee_text_ratio", "图内文字 ≤ 画面 20% 且不大于主体 —— 人工确认")
+    add("MANUAL", "amazon_main_text", "主图是否无促销文字、水印、无关 Logo —— 人工确认。阈值发布前复核")
 
     ok = not any(lv == "FAIL" for lv, _, _ in res)
     return dict(platform=plt_name, ok=ok, metrics=m, checks=res)
@@ -233,7 +213,7 @@ def main():
     ap = argparse.ArgumentParser(description="商品主图像素级合规校验")
     ap.add_argument("image")
     ap.add_argument("--platform", required=True, choices=list(PLATFORMS),
-                    help="shopee / mercadolivre / amazon")
+                    help="amazon。阈值来自规则卡，发布前复核")
     ap.add_argument("--tolerance", type=int, default=3, help="近白判定容差（默认 3）")
     ap.add_argument("--fix", metavar="OUT", help="自动修复并保存到指定路径")
     ap.add_argument("--json", action="store_true", help="输出 JSON")

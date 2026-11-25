@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
-"""广告决策层算术脚本（Shopee / Mercado Livre 广告）—— 只算，不猜，不执行。
+"""广告盈亏线算术 —— 只算，不猜，不执行。
 
-  python ad_metrics.py calc --price 113.40 --product-cost 55 --commission 14 \
-      --return 2 --tax 0 --target-acos 25 --cvr 0.44
+  python ad_metrics.py calc --price 40 --product-cost 18 --commission 15 --cvr 10 --target-acos 25
   python ad_metrics.py diagnose --file ../examples/sample-ad-report.csv \
-      --price 113.40 --product-cost 55 --commission 14 --return 2 --tax 0 --target-acos 25
+      --price 40 --product-cost 18 --commission 15 --target-acos 25
 
-设计原则（与 01 模块一致）：能算的别让模型猜。
-  本脚本只输出确定性数字与分级动作建议（P0 止血 / P1 改善 / P2 放量），
-  **不改后台、不执行** —— 执行由人决定（合规与风控要求）。
+佣金必须显式传入。amazon_us / amazon_eu 预设没有数字，不能当成 0。
+--cvr 的单位是百分数（10 表示 10%）。
+--target-acos 是调用方目标，不是官方基准。诊断命令不设默认目标。
+--min-impressions 默认 1000，只是数据量开关，不是平台冷启动规则。
 
-盈亏线公式（含巴西税费项）：
-  广告前贡献 = 售价 − 产品成本 − 头程 − 尾程 − 售价×佣金% − 售价×退货损耗% − 售价×税率%
-  盈亏线 ACoS = 广告前贡献 ÷ 售价      盈亏线 ROAS = 1 ÷ 盈亏线 ACoS
-  可承受 CPC  = 售价 × 转化率 × 目标 ACoS
-税率口径：巴西税制复杂（ICMS/PIS/COFINS/Simples Nacional），此处用「综合有效税率」
-  一个参数表示（按售价百分比），由使用者按自己的税制填。
+  广告前贡献 = 售价 − 产品成本 − 头程 − 尾程 − 售价×(佣金%+退货%+税%+附加%) − 按件固定费
+  盈亏线 ACoS = 广告前贡献 ÷ 售价
 """
 import argparse
 import csv
@@ -36,8 +32,16 @@ def _tier_lookup(price, tiers, default=0.0):
     return default
 
 
+def _rates_ready(preset) -> bool:
+    if not preset:
+        return False
+    if preset.get("rates_included") is False or preset.get("status") == "待核实":
+        return False
+    return "commission_pct" in preset or bool(preset.get("commission_tiers"))
+
+
 def _resolve_fees(args):
-    """费率解析：显式 CLI 参数 > 平台预设（--platform）> 0。"""
+    """显式参数优先。待核实预设不能当成 0 佣金。"""
     preset = None
     if getattr(args, "platform", None):
         try:
@@ -45,67 +49,52 @@ def _resolve_fees(args):
         except OSError:
             sys.exit(f"[ERROR] 读不到平台费率表：{PLATFORM_FEES}")
         key = args.platform.strip()
-        if key not in plats:
-            matches = [k for k in plats
-                       if not k.startswith("_") and (k == key or k.startswith(key + "_"))]
-            if len(matches) == 1:
-                key = matches[0]
-            else:
-                keys = "、".join(k for k in plats if not k.startswith("_"))
-                sys.exit(f"[INPUT_MISSING] 未知平台 {args.platform!r}。可用：{keys}")
+        if key not in plats or key.startswith("_"):
+            keys = "、".join(k for k in plats if not k.startswith("_"))
+            sys.exit(f"[INPUT_MISSING] 未知平台 {args.platform!r}。可用：{keys}")
         preset = plats[key]
 
-    price = args.price
     if args.commission is not None:
-        comm = args.commission
-    elif preset:
+        comm = float(args.commission)
+    elif _rates_ready(preset):
         if "commission_pct" in preset:
             comm = float(preset["commission_pct"])
-        elif preset.get("commission_tiers"):
-            comm = _tier_lookup(price, preset["commission_tiers"])
         else:
-            comm = 0.0
+            comm = _tier_lookup(args.price, preset.get("commission_tiers"))
     else:
-        comm = 0.0
+        sys.exit("[RATES_UNVERIFIED] 请传入 --commission。站点预设没有已核实费率，不能按 0 佣金计算。")
 
     def scalar(flag, pkey):
         if flag is not None:
             return float(flag)
-        if preset and pkey in preset:
+        if _rates_ready(preset) and preset and pkey in preset and preset[pkey] is not None:
             return float(preset[pkey])
         return 0.0
 
     if getattr(args, "fixed_fee", None) is not None:
         ff = float(args.fixed_fee)
-    elif preset and preset.get("fixed_fee_tiers"):
-        ff = _tier_lookup(price, preset["fixed_fee_tiers"])
+    elif _rates_ready(preset) and preset and preset.get("fixed_fee_tiers"):
+        ff = _tier_lookup(args.price, preset["fixed_fee_tiers"])
     else:
         ff = 0.0
 
+    label = (preset or {}).get("label", getattr(args, "platform", None) or "custom")
     return comm, scalar(args.return_rate, "return_pct"), scalar(args.tax, "tax_pct"), \
-        scalar(getattr(args, "extra_pct", None), "extra_pct"), ff, \
-        (preset or {}).get("label", getattr(args, "platform", None) or "custom")
-import sys
+        scalar(getattr(args, "extra_pct", None), "extra_pct"), ff, label
 
 # 列名自动映射（中 / 英 / 葡）
 COLUMN_MAP = {
-    "name":    ["广告名称", "广告组", "计划名称", "campaign", "name", "ad_group", "campanha"],
-    "impressions": ["曝光量", "曝光", "展示量", "impressions", "imps", "impressoes"],
-    "clicks":  ["点击量", "点击数", "点击", "clicks", "cliques"],
-    "spend":   ["花费", "消耗", "花费金额", "spend", "cost", "gasto"],
-    "orders":  ["订单数", "订单", "成交订单", "orders", "conversions", "pedidos"],
-    "gmv":     ["销售额", "成交金额", "广告销售额", "gmv", "sales", "receita"],
+    "name":    ["广告名称", "广告组", "计划名称", "campaign", "name", "ad_group"],
+    "impressions": ["曝光量", "曝光", "展示量", "impressions", "imps"],
+    "clicks":  ["点击量", "点击数", "点击", "clicks"],
+    "spend":   ["花费", "消耗", "花费金额", "spend", "cost"],
+    "orders":  ["订单数", "订单", "成交订单", "orders", "conversions"],
+    "gmv":     ["销售额", "成交金额", "广告销售额", "gmv", "sales"],
 }
 
 
 def _num(v, default=0.0, kind="dec"):
-    """容忍 'R$ 1.234,56' / '1,234' / '1.500' / '12.3%' / '-' / 空串。
-
-    kind="int"（曝光/点击/订单）：点、逗号一律视为千分位，只留数字。
-    kind="dec"（花费/销售额）：
-      同时有 , 和 .  → 靠右的是小数分隔符；
-      只有一个分隔符 → 小数位 ≤2 位按小数，否则按千分位（巴西 '1.500'=1500）。
-    """
+    """把金额和百分比读成数字。货币符号会去掉，不代表某一种官方货币。"""
     if v is None:
         return default
     s = str(v).strip().replace("R$", "").replace("%", "").replace(" ", "")
@@ -189,44 +178,38 @@ def _grade(row, m, args, be_roas, target_roas):
         return "INFO", ["无花费，本轮不动"], dict(ctr=ctr, cvr=cvr, cpc=cpc, roas=roas,
                                                 affordable_cpc=affordable_cpc, gmv=gmv)
 
-    # 1) CTR 检查（基准 3–5%，<2% 明确偏低）—— 症状指向素材，回流 04
-    if ctr < 0.02:
-        acts.append(f"CTR {ctr:.2%} 低于 2% —— 回流 04 换主图/首图（不要在广告端解决素材问题）")
-    elif ctr < 0.03:
-        acts.append(f"CTR {ctr:.2%} 处于 2–3% 观察区，暂不动素材")
+    def cpc_line():
+        if affordable_cpc is None:
+            return f"当前 CPC {cpc:.2f}。这次算不出可承受 CPC（转化率为 0 或盈亏线非正）。"
+        return (f"按本次费率，可承受 CPC 约 {affordable_cpc:.2f}，当前 {cpc:.2f}。"
+                "是否改出价由人决定，脚本不改后台。")
 
-    # 2) 订单为零（点击足够 = 素材没问题，落地页/价格/评论有问题）
     if orders == 0 and clk >= 30:
-        acts.append(f"点击 {clk:,.0f} 零订单 —— 回流 03 检查详情页与价格带，广告端只降出价止血")
-        acts.append(f"出价降至可承受 CPC {affordable_cpc:.2f} 以下（当前 CPC {cpc:.2f}）")
+        acts.append(f"点击 {clk:,.0f} 且订单为 0。建议人核对页面与价格。")
+        acts.append(cpc_line())
         return "P0", acts, dict(ctr=ctr, cvr=cvr, cpc=cpc, roas=roas,
                                 affordable_cpc=affordable_cpc, gmv=gmv)
 
-    # 3) ROAS 分级（锚盈亏线，不锚感觉）
-    if roas is None:
-        return "INFO", ["无花费数据"], dict(ctr=ctr, cvr=cvr, cpc=cpc, roas=None,
-                                            affordable_cpc=affordable_cpc, gmv=gmv)
+    if roas is None or be_roas is None:
+        return "INFO", ["花费或盈亏线不足，无法分级"], dict(
+            ctr=ctr, cvr=cvr, cpc=cpc, roas=roas,
+            affordable_cpc=affordable_cpc, gmv=gmv)
     if roas < 0.5 * be_roas:
-        acts.append(f"ROAS {roas:.2f} < 盈亏线一半（{be_roas:.2f}）—— P0 止血")
-        acts.append(f"预算降至最低档、出价降至 {affordable_cpc:.2f} 以下（当前 CPC {cpc:.2f}）")
-        acts.append("❗ 不要暂停广告 —— 暂停破坏连续性并降低广告权重（应降预算降出价，见 actions.md）")
+        acts.append(f"ROAS {roas:.2f} 低于盈亏线 {be_roas:.2f} 的一半。建议人先看是否止血。")
+        acts.append(cpc_line())
     elif roas < be_roas:
-        acts.append(f"ROAS {roas:.2f} 低于盈亏线 {be_roas:.2f} —— P1 改善")
-        acts.append(f"出价降至 {affordable_cpc:.2f} 以下（当前 CPC {cpc:.2f}），预算暂不动")
-        if cvr < 0.01:
-            acts.append(f"转化率 {cvr:.2%} < 1% —— 瓶颈在转化不在流量，回流 03/07，广告端不加大投放")
-    elif roas < target_roas:
-        acts.append(f"ROAS {roas:.2f} 在盈亏线与目标 {target_roas:.2f} 之间 —— P1 维持")
-        acts.append("预算与出价都不动；改善转化率是唯一杠杆")
+        acts.append(f"ROAS {roas:.2f} 低于盈亏线 {be_roas:.2f}。")
+        acts.append(cpc_line())
+    elif target_roas is not None and roas < target_roas:
+        acts.append(f"ROAS {roas:.2f} 在盈亏线与调用方目标 {target_roas:.2f} 之间。")
+        acts.append("脚本不建议自动加预算。")
     else:
-        acts.append(f"ROAS {roas:.2f} ≥ 目标 {target_roas:.2f} —— P2 放量")
-        acts.append("预算 +20~30%（一次只加这一档），观察 3 天再决定下一档")
+        acts.append(f"ROAS {roas:.2f} 不低于调用方目标 {target_roas:.2f}。是否放量由人决定。")
+        acts.append("脚本不给出加预算的幅度。")
 
-    # 4) 迭代纪律：输出「本轮明确不动」清单
-    keep = "预算与出价结构、素材、listing 文案" if roas >= be_roas else "listing 文案与素材"
-    acts.append(f"本轮明确不动：{keep}（一次只改一个病因）")
+    acts.append("本轮建议只处理上面这一条。没有写进建议的部分保持不动。")
     return ("P0" if roas < 0.5 * be_roas else
-            "P2" if roas >= target_roas else "P1"), acts, dict(
+            "P2" if target_roas is not None and roas >= target_roas else "P1"), acts, dict(
         ctr=ctr, cvr=cvr, cpc=cpc, roas=roas, affordable_cpc=affordable_cpc, gmv=gmv)
 
 
@@ -278,10 +261,10 @@ def cmd_diagnose(args):
     if not args.json:
         icon = {"P0": "🔴", "P1": "🟡", "P2": "🟢", "INFO": "⚪"}
         print(f"\n盈亏线 ROAS {be_roas} ｜ 目标 ROAS {target_roas} ｜ "
-              f"整体 ROAS {out['total']['roas']} ｜ 整体净贡献 R$ {out['total']['net_contribution']}\n")
+              f"整体 ROAS {out['total']['roas']} ｜ 整体净贡献 {out['total']['net_contribution']}\n")
         for c in out["campaigns"]:
             print(f"{icon[c['grade']]} [{c['grade']}] {c['campaign']}  "
-                  f"ROAS {c['roas'] if c['roas'] else '-'}  花费 R$ {c['spend']}  订单 {c['orders']:g}")
+                  f"ROAS {c['roas'] if c['roas'] else '-'}  花费 {c['spend']}  订单 {c['orders']:g}")
             for a in c["actions"]:
                 print(f"     · {a}")
             print()
@@ -293,18 +276,18 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     c = sub.add_parser("calc", help="由成本结构算盈亏线 / 可承受 CPC")
-    c.add_argument("--price", type=float, required=True, help="售价 R$")
+    c.add_argument("--price", type=float, required=True, help="售价")
     c.add_argument("--product-cost", type=float, required=True)
-    c.add_argument("--shipping", type=float, default=0, help="尾程运费")
-    c.add_argument("--first-leg", type=float, default=0, help="头程运费")
-    c.add_argument("--platform", help="平台费率预设 key（与 02 sku_pricing 共用 platform_fees.json）")
-    c.add_argument("--commission", type=float, default=None, help="平台佣金 %%（覆盖预设）")
-    c.add_argument("--return", dest="return_rate", type=float, default=None, help="退货损耗 %%（覆盖预设）")
-    c.add_argument("--tax", type=float, default=None, help="综合有效税率 %%（巴西税制自行折算）")
-    c.add_argument("--extra-pct", type=float, default=None, help="平台附加 %%（如免运计划；覆盖预设）")
-    c.add_argument("--fixed-fee", type=float, default=None, help="按件固定费 R$（覆盖预设阶梯）")
-    c.add_argument("--target-acos", type=float, help="目标 ACoS %%")
-    c.add_argument("--cvr", type=float, help="转化率 %%（算可承受 CPC 用）")
+    c.add_argument("--shipping", type=float, default=0, help="尾程，金额")
+    c.add_argument("--first-leg", type=float, default=0, help="头程，金额")
+    c.add_argument("--platform", help="站点键。当前预设不含费率")
+    c.add_argument("--commission", type=float, default=None, help="佣金 %%，必填")
+    c.add_argument("--return", dest="return_rate", type=float, default=None, help="退货预留 %%")
+    c.add_argument("--tax", type=float, default=None, help="税 %%。不传则本次按 0")
+    c.add_argument("--extra-pct", type=float, default=None, help="其他附加 %%")
+    c.add_argument("--fixed-fee", type=float, default=None, help="按件固定费")
+    c.add_argument("--target-acos", type=float, help="调用方的目标 ACoS %%")
+    c.add_argument("--cvr", type=float, help="转化率 %%，10 表示 10%%")
 
     d = sub.add_parser("diagnose", help="读广告导出 CSV → 指标 + P0/P1/P2 分级动作")
     d.add_argument("--file", required=True)
@@ -312,14 +295,15 @@ def main():
     d.add_argument("--product-cost", type=float, required=True)
     d.add_argument("--shipping", type=float, default=0)
     d.add_argument("--first-leg", type=float, default=0)
-    d.add_argument("--platform", help="平台费率预设 key（与 02 sku_pricing 共用 platform_fees.json）")
-    d.add_argument("--commission", type=float, default=None)
+    d.add_argument("--platform", help="站点键。当前预设不含费率")
+    d.add_argument("--commission", type=float, default=None, help="佣金 %%，必填")
     d.add_argument("--return", dest="return_rate", type=float, default=None)
     d.add_argument("--tax", type=float, default=None)
     d.add_argument("--extra-pct", type=float, default=None)
     d.add_argument("--fixed-fee", type=float, default=None)
-    d.add_argument("--target-acos", type=float, default=25)
-    d.add_argument("--min-impressions", type=int, default=1000, help="数据充分性门槛")
+    d.add_argument("--target-acos", type=float, required=True, help="调用方的目标 ACoS %%")
+    d.add_argument("--min-impressions", type=int, default=1000,
+                   help="数据量开关，默认 1000。不是平台官方规则")
     d.add_argument("--json", action="store_true")
 
     args = ap.parse_args()

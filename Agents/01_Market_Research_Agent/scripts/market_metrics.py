@@ -12,7 +12,7 @@ Agent 只负责解读"这些数字意味着什么、下一步做什么"。
 用法：
     python market_metrics.py <normalized.json> [--bins 10] [--top 10]
                              [--config-fields 功率,承重] [--format md|json]
-    python market_metrics.py data.normalized.json --config-fields "potencia,peso_max"
+    python market_metrics.py data.normalized.json --config-fields "power,load"
 """
 
 from __future__ import annotations
@@ -131,18 +131,11 @@ def _concentration(items: list[dict], key: str, top_n: int = 10) -> dict:
 # ---------------------------------------------------------------------------
 def price_bands(items: list[dict], n_bins: int = 10, valley_min_drop: float = 0.15,
                 max_bands: int = 5) -> dict:
-    """
-    SOP 1.4：横坐标价格区间、纵坐标销量，从波谷到波谷划分价格带。
+    """等宽分箱后，在原始销量曲线上找波谷，用来建议价格带边界。
 
-    实现：等宽分箱 → 统计销量 → **在原始曲线上**检局部最小值（波谷）→ 按波谷切分价格带。
-
-    两个关键参数：
-      valley_min_drop  波谷相对两侧邻居的最小跌幅，低于此值视为噪声（默认 0.15 = 15%）
-      max_bands        最多保留的价格带数，超出的按跌幅取前几名（默认 5）
-
-    注意：**不在默认流程里做平滑**。3 点滑动平均会把陡峭的局部波谷抹平
-    （例如 799 → 618 → 1120 的波谷会被平均掉），反而漏掉真实的价格带边界。
-    需要平滑时用 --smooth。
+    跌幅阈值和价格带数量是脚本参数，不是平台规则。
+    valley_min_drop 默认 0.15。max_bands 默认 5。
+    默认不做平滑，以免抹掉陡峭波谷。需要时用 --smooth。
     """
     pts = [(i["price"], i.get("monthly_sales") or 0, i.get("monthly_revenue") or 0)
            for i in items if i.get("price")]
@@ -236,30 +229,23 @@ def _extract_dim(item: dict, field: str) -> str | None:
 
     title = item.get("title") or ""
     # 数字 + 常见单位
-    if re.search(r"(?i)(power|watt|potência|potencia)", field) or field == "功率":
+    if re.search(r"(?i)(power|watt)", field) or field == "功率":
         m = re.search(r"(\d{2,4})\s*(?:w|W|瓦)", title)
         if m:
             return f"{m.group(1)}W"
-    if re.search(r"(?i)(weight|peso|承重|carga)", field) or field == "承重":
+    if re.search(r"(?i)(weight|load)", field) or field == "承重":
         m = re.search(r"(\d{2,3})\s*(?:kg|KG|公斤)", title)
         if m:
             return f"{m.group(1)}kg"
-    if re.search(r"(?i)(capacit|容量|容量|ah|mah|litro|L\b)", field) or field == "容量":
-        m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:mah|mAh|Ah|ah|L|L\b|litros)", title)
+    if re.search(r"(?i)(capacit|容量|ah|mah)", field) or field == "容量":
+        m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:mah|mAh|Ah|ah|L)\b", title)
         if m:
             return m.group(0)
     return None
 
 
 def config_matrix(items: list[dict], fields: list[str]) -> dict:
-    """
-    SOP 1.5：每个配置维度统计「商品数量 / 数量占比 / 平均销量 / 总销量」
-    并给出四维判断：
-      - 总销量高 → 需求大
-      - 平均销量高 → 单品效率高
-      - 数量占比高 → 主流（但竞争可能更激烈）
-      - 数量少但平均销量高 → 潜在机会配置
-    """
+    """按配置维度统计商品数量、占比、平均销量、总销量。是否构成机会由人判断。"""
     out: dict[str, Any] = {}
     total_items = len(items)
 
@@ -339,18 +325,20 @@ def render_md(payload: dict) -> str:
     L.append("# 类目指标计算报告\n")
     L.append(f"数据来源：`{payload['meta'].get('source_file', '—')}` ｜ "
              f"样本量：{cap['item_count']} 个商品\n")
+    if "synthetic" in str(payload["meta"].get("source_file", "")).lower():
+        L.append("> 来源文件名含 synthetic：这是合成夹具，不是市场实测。\n")
 
     L.append("## 1. 市场容量\n")
     L.append("| 指标 | 数值 |")
     L.append("|---|---|")
     L.append(f"| 样本商品数 | {cap['item_count']} |")
     L.append(f"| 月总销量 | {cap['total_monthly_sales']:,} |")
-    L.append(f"| 月总销售额 | R$ {_fmt_money(cap['total_monthly_revenue'])} |")
-    L.append(f"| 均价 | R$ {_fmt_money(cap['avg_price'])} |")
-    L.append(f"| 中位价 | R$ {_fmt_money(cap['median_price'])} |")
-    L.append(f"| 价格范围 | R$ {_fmt_money(cap['price_min'])} – R$ {_fmt_money(cap['price_max'])} |")
+    L.append(f"| 月总销售额 | 金额 {_fmt_money(cap['total_monthly_revenue'])} |")
+    L.append(f"| 均价 | 金额 {_fmt_money(cap['avg_price'])} |")
+    L.append(f"| 中位价 | 金额 {_fmt_money(cap['median_price'])} |")
+    L.append(f"| 价格范围 | 金额 {_fmt_money(cap['price_min'])} – 金额 {_fmt_money(cap['price_max'])} |")
     L.append(f"| 单商品平均月销量 | {cap['avg_monthly_sales_per_item']} |")
-    L.append(f"| 隐含均价（GMV÷销量） | R$ {_fmt_money(cap['implied_avg_price'])} |")
+    L.append(f"| 隐含均价（GMV÷销量） | 金额 {_fmt_money(cap['implied_avg_price'])} |")
     L.append(f"| 头部 10 名销售额占比 | {_fmt_pct(cap.get('rev_share_top10', 0))} |")
     L.append("")
 
@@ -367,10 +355,10 @@ def render_md(payload: dict) -> str:
         L.append("| # | 品牌 | 销售额 | 销售额占比 | 销量占比 | 商品数 |")
         L.append("|---|---|---|---|---|---|")
         for r in br["top_list"][:10]:
-            L.append(f"| {r['rank']} | {r['name']} | R$ {_fmt_money(r['revenue'])} | "
+            L.append(f"| {r['rank']} | {r['name']} | 金额 {_fmt_money(r['revenue'])} | "
                      f"{_fmt_pct(r['revenue_share'])} | {_fmt_pct(r['sales_share'])} | {r['item_count']} |")
         L.append("")
-        L.append("> **判断**（SOP 1.3）：品牌集中度 < 50% → 白牌仍有机会；> 50% → 头部品牌影响强，需谨慎。\n")
+        L.append("> 上表是计数结果。是否进入该类目由人判断，本脚本不套用固定的集中度百分比门槛。\n")
 
     sl = payload.get("seller_concentration")
     if sl:
@@ -392,8 +380,8 @@ def render_md(payload: dict) -> str:
     pb = payload.get("price_bands")
     if pb and pb.get("bins"):
         L.append("## 4. 价格带分析\n")
-        L.append(f"- 价格范围：R$ {_fmt_money(pb['price_range'][0])} – R$ {_fmt_money(pb['price_range'][1])}"
-                 f" ｜ 箱宽：R$ {_fmt_money(pb['bin_width'])}")
+        L.append(f"- 价格范围：金额 {_fmt_money(pb['price_range'][0])} – 金额 {_fmt_money(pb['price_range'][1])}"
+                 f" ｜ 箱宽：金额 {_fmt_money(pb['bin_width'])}")
         L.append("")
         L.append("### 4.1 等宽分箱（销量曲线）\n")
         L.append("| 区间 | 价格段 | 商品数 | 总销量 | 曲线 | 总销售额 | 单商品均销 |")
@@ -401,9 +389,9 @@ def render_md(payload: dict) -> str:
         peak = max((b["total_sales"] for b in pb["bins"]), default=0)
         for b in pb["bins"]:
             bar = "█" * int(_safe_div(b["total_sales"], peak) * 20) if peak else ""
-            L.append(f"| {b['index']} | R$ {_fmt_money(b['price_lo'])}–{_fmt_money(b['price_hi'])} | "
+            L.append(f"| {b['index']} | 金额 {_fmt_money(b['price_lo'])}–{_fmt_money(b['price_hi'])} | "
                      f"{b['item_count']} | {b['total_sales']:,} | {bar} | "
-                     f"R$ {_fmt_money(b['total_revenue'])} | {b['avg_sales_per_item']} |")
+                     f"金额 {_fmt_money(b['total_revenue'])} | {b['avg_sales_per_item']} |")
         L.append("")
         L.append("### 4.2 波谷检测\n")
         if pb.get("valleys"):
@@ -412,12 +400,12 @@ def render_md(payload: dict) -> str:
             L.append("| 箱序 | 价格边界 | 跌幅 | 作为价格带边界 |")
             L.append("|---|---|---|---|")
             for v in pb["valleys"]:
-                L.append(f"| {v['bin_index']} | R$ {_fmt_money(v['price'])} | {_fmt_pct(v['drop'])} | ✅ |")
+                L.append(f"| {v['bin_index']} | 金额 {_fmt_money(v['price'])} | {_fmt_pct(v['drop'])} | ✅ |")
             L.append("")
             if pb.get("noise_valleys"):
                 L.append(f"> 另有 {pb['noise_valleys']} 个跌幅不足阈值的候选波谷被过滤为噪声。\n")
             if pb.get("trimmed_valleys"):
-                names = "、".join(f"箱{v['bin_index']}(R$ {_fmt_money(v['price'])})"
+                names = "、".join(f"箱{v['bin_index']}(金额 {_fmt_money(v['price'])})"
                                 for v in pb["trimmed_valleys"])
                 L.append(f"> 因超出最多价格带数（{pb.get('max_bands', 5)}）被裁掉：{names}。"
                          f"如需保留请调大 `--max-bands`。\n")
@@ -429,12 +417,11 @@ def render_md(payload: dict) -> str:
             L.append("| 价格带 | 区间 | 商品数 | 总销量 | 总销售额 | 单商品均销 |")
             L.append("|---|---|---|---|---|---|")
             for b in pb["suggested_bands"]:
-                L.append(f"| #{b['band_index']} | R$ {_fmt_money(b['price_from'])}–{_fmt_money(b['price_to'])} | "
+                L.append(f"| #{b['band_index']} | 金额 {_fmt_money(b['price_from'])}–{_fmt_money(b['price_to'])} | "
                          f"{b['item_count']} | {b['total_sales']:,} | "
-                         f"R$ {_fmt_money(b['total_revenue'])} | {b['avg_sales_per_item']} |")
+                         f"金额 {_fmt_money(b['total_revenue'])} | {b['avg_sales_per_item']} |")
             L.append("")
-            L.append("> ⚠️ 波谷切分只是**数学建议**。SOP 1.4 要求最终判断还要叠加："
-                     "公司产品有没有利润、竞品是否特别强。这一步由 Agent 结合成本结构完成。\n")
+            L.append("> 波谷切分只是数学建议。利润和竞争还要人用自己的成本来看，脚本不代下结论。\n")
 
     cm = payload.get("config_matrix")
     if cm:
@@ -456,11 +443,7 @@ def render_md(payload: dict) -> str:
                          f"{r['total_sales']:,} | {_fmt_pct(r['sales_share'])} | {r['avg_sales']} | "
                          f"{'；'.join(r['judgement'])} |")
             L.append("")
-        L.append("> **判断规则**（SOP 1.5）：总销量高 = 需求大（销量占比 ≥30%）；"
-                 "平均销量高 = 单品效率高（高于整体均值 1.2 倍）；"
-                 "数量占比高 = 主流但竞争激烈（高于均分 1.5 倍）；"
-                 "**数量少但平均销量高 = 潜在机会配置**（低于均分 0.6 倍且效率高，需再确认是否被头部占据）；"
-                 "总销量高但平均销量低 = 市场大但竞争激烈。\n")
+        L.append("> 上表的「判断」列只是相对均值的描述，不是进入该类目的官方标准。\n")
 
     return "\n".join(L)
 
@@ -468,7 +451,7 @@ def render_md(payload: dict) -> str:
 # ---------------------------------------------------------------------------
 def main() -> None:
     ap = argparse.ArgumentParser(description="类目指标计算（集中度 / 价格带 / 配置交叉表）")
-    ap.add_argument("input", help="shaduola_parser.py 产出的 normalized.json")
+    ap.add_argument("input", help="normalize_export.py 产出的 normalized.json")
     ap.add_argument("--bins", type=int, default=10, help="价格分箱数（默认 10）")
     ap.add_argument("--top", type=int, default=10, help="CR-n 与 Top 榜单长度（默认 10）")
     ap.add_argument("--config-fields", default="", help="配置维度字段，逗号分隔，如 功率,承重")
@@ -485,7 +468,7 @@ def main() -> None:
         data = json.load(f)
     items = data.get("items", [])
     if not items:
-        sys.exit("[ERROR] 输入 JSON 里没有 items。请先用 shaduola_parser.py 转换。")
+        sys.exit("[ERROR] 输入 JSON 里没有 items。请先用 normalize_export.py 转换。")
 
     cap = market_capacity(items)
     brand = _concentration(items, args.brand_field, args.top)
@@ -521,9 +504,8 @@ def main() -> None:
         print(md)
 
     print("\n" + "=" * 60)
-    print("给 Agent 的输入：把上面这份指标报告（JSON 或 MD）连同 "
-          "templates/input_category_data.md 一起提交。")
-    print("Agent 只负责解读，不负责重算。若数字有疑问，回来改脚本参数。")
+    print("给 Agent 的输入：把这份指标报告连同 templates/input_category_research.md 一起提交。")
+    print("Agent 只负责解读，不负责重算。样本数字不是市场结论。")
 
 
 if __name__ == "__main__":

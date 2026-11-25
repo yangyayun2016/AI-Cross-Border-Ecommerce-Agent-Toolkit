@@ -6,7 +6,7 @@ make_sample.py — 生成一份带"脏数据"的样本类目导出表
 用途：让使用者一拿到仓库就能立刻跑通 scripts/ 下的两个脚本，验证环境。
 数据是**合成数据**，用于演示格式与清洗能力，不代表任何真实市场。
 
-用法：python make_sample.py [-o ../samples/sample_patinete_eletrico.csv]
+用法：python make_sample.py [-o ../samples/sample_category_synthetic.csv]
 """
 
 import argparse
@@ -18,19 +18,18 @@ random.seed(20261013)
 
 # 品牌：头部 2 个 + 一批白牌（模拟"白牌仍有机会"的市场）
 BRANDS = (
-    ["MarcaA"] * 6 + ["MarcaB"] * 4 + ["MarcaC"] * 3
-    + ["Generic"] * 12 + ["Sem marca"] * 15 + ["Outras"] * 10
+    ["BrandA"] * 6 + ["BrandB"] * 4 + ["BrandC"] * 3
+    + ["Generic"] * 12 + ["Unbranded"] * 15 + ["Other"] * 10
 )
 
-# 卖家：CR10 由数据自然形成（3 个大卖家 + 一批小卖家）
 SELLERS = (
-    ["LojaGrande1"] * 8 + ["LojaGrande2"] * 6 + ["LojaGrande3"] * 5
-    + [f"LojaPequena{i:02d}" for i in range(1, 32)]
+    ["SellerLarge1"] * 8 + ["SellerLarge2"] * 6 + ["SellerLarge3"] * 5
+    + [f"SellerSmall{i:02d}" for i in range(1, 32)]
 )
 
-POWERS = ["350W", "500W", "500W", "500W", "800W"]      # 500W 为主流
-LOADS = ["100kg", "120kg", "150kg", "150kg", "150kg"]  # 150kg 为主流
-FOLDABLE = ["Dobrável", "Dobrável", "Dobrável", "Não dobrável"]
+POWERS = ["350W", "500W", "500W", "500W", "800W"]
+LOADS = ["100kg", "120kg", "150kg", "150kg", "150kg"]
+FOLDABLE = ["Foldable", "Foldable", "Foldable", "Not foldable"]
 
 # 价格带设计：1500–3200，销量在 1800–2400 集中（给波谷检测留出可识别结构）
 PRICE_ANCHORS = [
@@ -73,9 +72,9 @@ def dirty(v) -> str:
         if style == "plain":
             return f"{v:.2f}"
         if style == "currency":
-            return f"R$ {v:,.2f}"
+            return f"$ {v:,.2f}"
         if style == "currency_comma_dot":
-            return f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            return f"€ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
         return f"{v:.2f}"
     # int
     if style == "thousands_dot":
@@ -83,7 +82,7 @@ def dirty(v) -> str:
     if style == "thousands_comma":
         return f"{v:,}"
     if style == "currency":
-        return f"R$ {v:,}".replace(",", ".")
+        return f"$ {v:,}".replace(",", ".")
     if style == "plain":
         return str(v)
     return str(v)
@@ -102,7 +101,7 @@ def age_dirty(days: int) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    default_out = Path(__file__).resolve().parent.parent / "samples" / "sample_patinete_eletrico.csv"
+    default_out = Path(__file__).resolve().parent.parent / "samples" / "sample_category_synthetic.csv"
     ap.add_argument("-o", "--output", default=str(default_out))
     ap.add_argument("-n", "--rows", type=int, default=50)
     args = ap.parse_args()
@@ -132,9 +131,9 @@ def main() -> None:
             if i in opportunity_slots and 1900 <= p < 2400:
                 load = "200kg"
 
-            title = (f"Patinete Elétrico Adulto {power} {load} Bateria {cap} "
-                     f"com Banco {fold} para Mobilidade Urbana")
-            if brand not in ("Generic", "Sem marca", "Outras"):
+            title = (f"Sample widget adult {power} {load} battery {cap} "
+                     f"{fold} urban mobility fixture")
+            if brand not in ("Generic", "Unbranded", "Other"):
                 title = f"{brand} {title}"
 
             rating = round(random.uniform(4.0, 5.0), 1)

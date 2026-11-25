@@ -4,7 +4,7 @@
 video_timing.py — 05 Product Video Agent 的确定性算术层。
 
 只算，不判断"写得好不好"：
-  1. 逐句配音词数 → 预估时长（默认 PT-BR 语速 2.5 词/秒，可用 --wps 调）
+  1. 逐句配音词数 → 预估时长（默认 2.5 词/秒，只是脚本默认值，不是平台标准，可用 --wps 调）
   2. 时间轴（每句起止 + 累计）
   3. 字幕行长（默认 > 42 字符/行告警）
   4. 钩子检查（第一句 ≤ 8 词，保证 3 秒内说完）
@@ -27,17 +27,10 @@ from pathlib import Path
 
 # ---------------------------------------------------------------- 常量
 
-DEFAULT_WPS = 2.5          # PT-BR 口播语速：约 150 词/分钟
-DEFAULT_SUBTITLE_MAX = 42  # 单行字幕字符上限（移动端可读性经验值）
+DEFAULT_WPS = 2.5          # 脚本默认语速，不是亚马逊官方口播标准
+DEFAULT_SUBTITLE_MAX = 42  # 单行字幕提醒阈值（可读性经验值，不是官方上限）
 HOOK_MAX_WORDS = 8         # 第一句钩子词数上限（≈3 秒）
 TOLERANCE = 0.15           # 总时长相对目标的允许偏差 ±15%
-
-PLATFORM_TARGETS = {
-    "shopee15": 15, "shopee30": 30,
-    "mercadolivre15": 15, "mercadolivre30": 30,
-    "15": 15, "30": 30,
-}
-
 
 # ---------------------------------------------------------------- 工具
 
@@ -107,7 +100,7 @@ def analyze(lines: list[tuple[int, str]], wps: float, subtitle_max: int) -> dict
         hook_note = (
             f"第一句 {rows[0]['words']} 词 > {HOOK_MAX_WORDS} 词，"
             f"按 {wps} 词/秒需 {_fmt_sec(rows[0]['est_seconds'])}，"
-            f"超过 3 秒黄金开场窗口，建议精简钩子"
+            f"按当前语速超过约 3 秒。若希望第一句更短，请精简。这不是平台规则。"
         )
         issues.append(hook_note)
 
@@ -136,7 +129,7 @@ def target_check(total: float, target: float | None) -> dict | None:
 
 def to_markdown(res: dict, chk: dict | None, wps: float, subtitle_max: int) -> str:
     L = ["# 配音时长与字幕校验报告\n"]
-    L.append(f"- 语速假设：**{wps} 词/秒**（PT-BR 口播经验值，可 --wps 调整）")
+    L.append(f"- 语速假设：**{wps} 词/秒**（脚本参数，不是平台标准，可 --wps 调整）")
     L.append(f"- 字幕单行上限：**{subtitle_max} 字符**")
     L.append(f"- 总句数：**{len(res['rows'])}**")
     L.append(f"- 预估总时长：**{_fmt_sec(res['total_seconds'])}**")
@@ -168,7 +161,7 @@ def to_markdown(res: dict, chk: dict | None, wps: float, subtitle_max: int) -> s
 def main() -> None:
     ap = argparse.ArgumentParser(description="配音时长与字幕校验（确定性算术）")
     ap.add_argument("--script", required=True, help="配音稿文本：一行 = 一句台词")
-    ap.add_argument("--target", help="目标秒数（15 / 30）或平台键 shopee15/shopee30 等")
+    ap.add_argument("--target", help="调用方的目标秒数，例如 20。不是平台官方上限")
     ap.add_argument("--wps", type=float, default=DEFAULT_WPS, help=f"语速，词/秒（默认 {DEFAULT_WPS}）")
     ap.add_argument("--subtitle-max", type=int, default=DEFAULT_SUBTITLE_MAX,
                     help=f"单行字幕字符上限（默认 {DEFAULT_SUBTITLE_MAX}）")
@@ -180,13 +173,10 @@ def main() -> None:
     target = None
     if args.target:
         key = str(args.target).strip().lower()
-        target = PLATFORM_TARGETS.get(key)
-        if target is None:
-            try:
-                target = float(key)
-            except ValueError:
-                sys.exit(f"[INPUT_MISSING] 无法识别的目标时长：{args.target}"
-                         f"（可用：{', '.join(sorted(PLATFORM_TARGETS))} 或任意秒数）")
+        try:
+            target = float(key)
+        except ValueError:
+            sys.exit(f"[INPUT_MISSING] --target 需要秒数，收到：{args.target}")
 
     res = analyze(lines, args.wps, args.subtitle_max)
     chk = target_check(res["total_seconds"], target)
